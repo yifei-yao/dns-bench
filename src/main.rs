@@ -7,12 +7,17 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
+use tokio::time::{interval, timeout, MissedTickBehavior};
 
 #[macro_use]
 extern crate serde_json;
 
-const CONCURRENCY: usize = 100;
+/// Maximum queries per second sent to any single DNS server.
+const MAX_REQUESTS_PER_SECOND: f64 = 5.0;
+/// Maximum in-flight (pending) queries allowed per DNS server.
+const MAX_PENDING_PER_SERVER: usize = 5;
+/// Any query taking longer than this is counted as a timeout (failure).
+const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 struct DnsServer {
@@ -57,17 +62,6 @@ fn generate_random_subdomain(domain: &str) -> String {
     format!("{}.{}", random_string, domain)
 }
 
-fn generate_global_permutation(num_servers: usize, num_domains: usize) -> Vec<(usize, usize)> {
-    let mut indices: Vec<(usize, usize)> = (0..num_servers)
-        .flat_map(|server_idx| (0..num_domains).map(move |domain_idx| (server_idx, domain_idx)))
-        .collect();
-
-    let mut rng = rand::thread_rng();
-    indices.shuffle(&mut rng);
-
-    indices
-}
-
 async fn raw_dns_query(dns_server_ip: &str, domain: &str) -> Result<Duration, String> {
     let socket = if dns_server_ip.contains(':') {
         // IPv6 socket
@@ -88,31 +82,50 @@ async fn raw_dns_query(dns_server_ip: &str, domain: &str) -> Result<Duration, St
 
     let start = Instant::now();
 
-    timeout(Duration::from_secs(1), socket.send_to(&query, &server_addr))
-        .await
-        .map_err(|_| "Send timeout".to_string())?
-        .map_err(|e| format!("Failed to send DNS query: {}", e))?;
+    // The whole exchange (send + receive) shares a single QUERY_TIMEOUT budget.
+    let exchange = timeout(QUERY_TIMEOUT, async {
+        socket
+            .send_to(&query, &server_addr)
+            .await
+            .map_err(|e| format!("Failed to send DNS query: {}", e))?;
 
-    let mut buf = [0u8; 512];
+        let mut buf = [0u8; 512];
+        let (size, _) = socket
+            .recv_from(&mut buf)
+            .await
+            .map_err(|e| format!("Failed to receive DNS response: {}", e))?;
 
-    let (size, _) = timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
-        .await
-        .map_err(|_| "Receive timeout".to_string())?
-        .map_err(|e| format!("Failed to receive DNS response: {}", e))?;
+        if size > 0 {
+            Ok(())
+        } else {
+            Err("No response received".to_string())
+        }
+    })
+    .await;
 
-    if size > 0 {
-        Ok(start.elapsed())
-    } else {
-        Err("No response received".into())
+    match exchange {
+        Err(_) => Err(format!("Timeout (>{}ms)", QUERY_TIMEOUT.as_millis())),
+        Ok(Err(e)) => Err(e),
+        Ok(Ok(())) => {
+            let elapsed = start.elapsed();
+            // Even if the response arrived, anything over the budget counts as a timeout.
+            if elapsed > QUERY_TIMEOUT {
+                Err(format!("Timeout (>{}ms)", QUERY_TIMEOUT.as_millis()))
+            } else {
+                Ok(elapsed)
+            }
+        }
     }
 }
 
 fn build_dns_query(domain: &str) -> Vec<u8> {
+    let transaction_id: u16 = rand::thread_rng().gen();
+
     let mut query: Vec<u8> = Vec::new();
 
     // DNS header
+    query.extend(&transaction_id.to_be_bytes()); // Transaction ID (actually randomized now)
     query.extend(&[
-        0x12, 0x34, // Transaction ID (randomized)
         0x01, 0x00, // Flags (standard query)
         0x00, 0x01, // Questions: 1
         0x00, 0x00, // Answer RRs: 0
@@ -134,46 +147,88 @@ fn build_dns_query(domain: &str) -> Vec<u8> {
     query
 }
 
-async fn run_tests(
-    dns_servers: Vec<DnsServer>,
-    domains: Vec<String>,
-    max_concurrent_tasks: usize,
-) -> Vec<DnsResult> {
-    let len = dns_servers.len() as u8;
-    let dns_servers = Arc::new(dns_servers);
+async fn run_tests(dns_servers: Vec<DnsServer>, domains: Vec<String>) -> Vec<DnsResult> {
+    let num_servers = dns_servers.len();
     let domains = Arc::new(domains);
-    let semaphore = Arc::new(Semaphore::new(max_concurrent_tasks));
-    let global_permutation = generate_global_permutation(dns_servers.len(), domains.len());
 
-    let (sender, mut receiver) = mpsc::channel::<(usize, Result<Duration, String>)>(CONCURRENCY);
+    let (sender, mut receiver) = mpsc::channel::<(usize, Result<Duration, String>)>(
+        (num_servers * MAX_PENDING_PER_SERVER).max(1),
+    );
 
     // Spawn the results processing task
-    let results_handle = tokio::spawn(async move { process_results(&mut receiver, len).await });
+    let results_handle =
+        tokio::spawn(async move { process_results(&mut receiver, num_servers).await });
 
-    // Spawn DNS query tasks
-    for (server_idx, domain_idx) in global_permutation {
-        let random_domain = generate_random_subdomain(&domains[domain_idx]);
-        let dns_servers = Arc::clone(&dns_servers);
-        let semaphore = Arc::clone(&semaphore);
+    // One independent task per server, each with its own rate limit and pending cap
+    let mut server_handles = Vec::with_capacity(num_servers);
+    for (server_idx, server) in dns_servers.into_iter().enumerate() {
+        let domains = Arc::clone(&domains);
         let sender = sender.clone();
-
-        tokio::spawn(async move {
-            let server = &dns_servers[server_idx];
-            run_dns(semaphore, &server.ip, server_idx, &random_domain, sender).await;
-        });
+        server_handles.push(tokio::spawn(run_server_tests(
+            server, server_idx, domains, sender,
+        )));
     }
 
     drop(sender); // Close the sender to signal no more tasks
+
+    for handle in server_handles {
+        let _ = handle.await;
+    }
 
     // Wait for the results processing task to complete
     results_handle.await.expect("Failed to process results")
 }
 
+async fn run_server_tests(
+    server: DnsServer,
+    server_idx: usize,
+    domains: Arc<Vec<String>>,
+    sender: mpsc::Sender<(usize, Result<Duration, String>)>,
+) {
+    // Cap on in-flight queries for this server
+    let pending = Arc::new(Semaphore::new(MAX_PENDING_PER_SERVER));
+
+    // Rate limiter: one launch slot every 1/MAX_REQUESTS_PER_SECOND seconds.
+    // Delay (rather than burst) if we fall behind while waiting on the pending cap.
+    let mut ticker = interval(Duration::from_secs_f64(1.0 / MAX_REQUESTS_PER_SECOND));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    // Randomize the order this server walks through the domain list
+    let mut domain_order: Vec<usize> = (0..domains.len()).collect();
+    domain_order.shuffle(&mut rand::thread_rng());
+
+    let mut query_handles = Vec::with_capacity(domain_order.len());
+    for domain_idx in domain_order {
+        // Backpressure: wait for a free pending slot on this server...
+        let permit = Arc::clone(&pending)
+            .acquire_owned()
+            .await
+            .expect("Semaphore closed unexpectedly");
+        // ...then wait for the next rate-limit slot.
+        ticker.tick().await;
+
+        let random_domain = generate_random_subdomain(&domains[domain_idx]);
+        let server_ip = server.ip.clone();
+        let sender = sender.clone();
+
+        query_handles.push(tokio::spawn(async move {
+            let result = raw_dns_query(&server_ip, &random_domain).await;
+            let _ = sender.send((server_idx, result)).await;
+            drop(permit); // Release this server's pending slot
+        }));
+    }
+
+    // Wait for this server's in-flight queries to finish
+    for handle in query_handles {
+        let _ = handle.await;
+    }
+}
+
 async fn process_results(
     receiver: &mut mpsc::Receiver<(usize, Result<Duration, String>)>,
-    len: u8,
+    num_servers: usize,
 ) -> Vec<DnsResult> {
-    let mut results = vec![DnsResult::default(); len as usize];
+    let mut results = vec![DnsResult::default(); num_servers];
     while let Some((server_idx, result)) = receiver.recv().await {
         match result {
             Ok(duration) => results[server_idx].successes.push(duration),
@@ -181,18 +236,6 @@ async fn process_results(
         }
     }
     results
-}
-
-async fn run_dns(
-    semaphore: Arc<Semaphore>,
-    server_ip: &str,
-    server_index: usize,
-    domain: &str,
-    reporter: mpsc::Sender<(usize, Result<Duration, String>)>,
-) {
-    let _permit = semaphore.acquire().await.unwrap();
-    let result = raw_dns_query(server_ip, domain).await;
-    let _ = reporter.send((server_index, result)).await;
 }
 
 fn process_and_save_results(dns_servers: &[DnsServer], results: Vec<DnsResult>, file_name: &str) {
@@ -257,7 +300,13 @@ async fn main() {
     let dns_servers = read_dns_servers("dns_servers.txt");
     let domains = read_domains("domains.txt");
     println!("Starting DNS Benchmark...");
-    let results = run_tests(dns_servers.clone(), domains, CONCURRENCY).await;
+    println!(
+        "Per-server limits: {} req/s, {} max pending, {}ms timeout",
+        MAX_REQUESTS_PER_SECOND,
+        MAX_PENDING_PER_SERVER,
+        QUERY_TIMEOUT.as_millis()
+    );
+    let results = run_tests(dns_servers.clone(), domains).await;
     process_and_save_results(&dns_servers, results, "results.json");
     println!("Benchmark completed. Results saved to results.json");
 }
